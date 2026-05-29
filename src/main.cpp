@@ -32,16 +32,17 @@ SemaphoreHandle_t i2cMutex;
 SemaphoreHandle_t bufferMutex;
 
 // Global State
-SystemMode currentSystemMode = MODE_OFFLINE;
+SystemMode currentSystemMode = MODE_ONLINE; // Requirement 1: Start in ONLINE
 RelayConfig relays[8];
 SensorData latestSensors[MAX_SENSORS];
 float sensorBuffer[MAX_SENSORS][BUFFER_SIZE];
 int bufferIndex = 0;
+bool sd_ready = false; // Requirement 2: SD Ready flag
 
 // WiFi Config
 char wifi_ssid[32] = "Your_SSID";
 char wifi_pass[64] = "Your_PASS";
-const char* ap_ssid = "SmartFarm-AP";
+const char* ap_ssid = "SmartFarm_Config"; // Requirement 1: Update SSID
 const char* ap_pass = "12345678";
 
 // MQTT Topics (Globals)
@@ -108,8 +109,16 @@ void setup() {
     rtc.begin();
     dht.begin();
     LittleFS.begin(true);
+    
+    // Requirement 2: Graceful SD handling
     SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
-    SD.begin(SD_CS);
+    if (SD.begin(SD_CS)) {
+        sd_ready = true;
+        Serial.println("SD Card Initialized");
+    } else {
+        sd_ready = false;
+        Serial.println("SD Card Failed or Not Present");
+    }
 
     loadConfig();
 
@@ -133,7 +142,7 @@ void Task_SensorRead(void *pvParameters) {
             
             float ph_volts = raw_ph * 0.0001875;
             latestSensors[S_PH].value = (ph_volts * calib.ph_slope) + calib.ph_intercept;
-            latestSensors[S_PH].is_valid = (raw_ph > 0 && raw_ph < 32767);
+            latestSensors[S_PH].is_valid = (raw_ph > 0 && raw_ph < 32767); // Requirement 4: NaN/Range Check
             
             float tds_volts = raw_tds * 0.0001875;
             latestSensors[S_TDS].value = tds_volts * 1000 * calib.tds_factor; 
@@ -149,7 +158,7 @@ void Task_SensorRead(void *pvParameters) {
         float t = dht.readTemperature();
         float h = dht.readHumidity();
         latestSensors[S_TEMP].value = t;
-        latestSensors[S_TEMP].is_valid = !isnan(t);
+        latestSensors[S_TEMP].is_valid = !isnan(t); // Requirement 4: NaN Check
         latestSensors[S_HUMID].value = h;
         latestSensors[S_HUMID].is_valid = !isnan(h);
 
@@ -178,17 +187,17 @@ void Task_RelayControl(void *pvParameters) {
         for (int i = 0; i < 8; i++) {
             RelayConfig &r = relays[i];
 
-            // 1. Manual Override Timer Check
+            // 1. Manual Override Timer Check (Requirement 3: Auto-Revert)
             if (r.current_mode == RELAY_MANUAL) {
                 if (millis() > r.manual_override_end_ms) {
                     r.current_mode = RELAY_AUTO;
-                    r.current_state = false; // Reset to OFF before sensor evaluation
+                    r.current_state = false; // Force OFF on revert
                     Serial.printf("Relay %d: Manual override expired, switching to AUTO\n", i + 1);
                 }
             }
 
-            // 2. Safety Halt (Sensor Validity Check)
-            if (r.bound_sensor_id != S_NONE) {
+            // 2. Safety Halt (Requirement 4: Force OFF if bound sensor is invalid)
+            if (r.current_mode == RELAY_AUTO && r.bound_sensor_id != S_NONE) {
                 if (!latestSensors[r.bound_sensor_id].is_valid) {
                     r.safety_halt = true;
                     r.current_state = false; // Force OFF
@@ -228,7 +237,7 @@ void Task_HealthCheck(void *pvParameters) {
             digitalWrite(BUZZER_PIN, HIGH);
         } else {
             if (currentSystemMode == MODE_SAFE) {
-                currentSystemMode = MODE_OFFLINE;
+                currentSystemMode = MODE_ONLINE;
                 if (mqttClient.connected()) mqttClient.publish(statusTopic.c_str(), "{\"status\":\"Online\"}");
             }
             digitalWrite(BUZZER_PIN, LOW);
@@ -241,10 +250,8 @@ int wifi_retries = 0;
 const int MAX_WIFI_RETRIES = 3;
 
 void setupWebServer() {
-    // Serve Static Files from LittleFS (Gzipped)
     server.serveStatic("/", LittleFS, "/www/").setDefaultFile("index.html").setCacheControl("max-age=600");
 
-    // Local API: Get Sensors
     server.on("/api/sensors", HTTP_GET, [](AsyncWebServerRequest *request){
         JsonDocument doc;
         for(int i=0; i<S_NONE; i++) {
@@ -255,7 +262,6 @@ void setupWebServer() {
         request->send(200, "application/json", response);
     });
 
-    // Local API: Get/Set Relays
     server.on("/api/relays", HTTP_GET, [](AsyncWebServerRequest *request){
         JsonDocument doc;
         JsonArray arr = doc.to<JsonArray>();
@@ -270,7 +276,6 @@ void setupWebServer() {
         request->send(200, "application/json", response);
     });
 
-    // Local API: Update WiFi Config
     server.on("/api/config", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
         JsonDocument doc;
         deserializeJson(doc, data);
@@ -286,7 +291,6 @@ void setupWebServer() {
         }
     });
 
-    // Local API: Calibrate Sensors
     server.on("/api/calibrate", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
         JsonDocument doc;
         deserializeJson(doc, data);
@@ -297,9 +301,9 @@ void setupWebServer() {
         request->send(200, "application/json", "{\"success\":true}");
     });
 
-    // Captive Portal Redirect
     server.onNotFound([](AsyncWebServerRequest *request){
-        request->redirect("http://192.168.4.1/");
+        if (currentSystemMode == MODE_OFFLINE) request->redirect("http://192.168.4.1/");
+        else request->send(404);
     });
 
     server.begin();
@@ -317,6 +321,8 @@ void Task_Network(void *pvParameters) {
 
     setupWebServer();
 
+    static bool ap_started = false; // Requirement 1: AP Init fix
+
     for (;;) {
         if (currentSystemMode != MODE_OFFLINE) {
             if (WiFi.status() == WL_CONNECTED) {
@@ -332,16 +338,21 @@ void Task_Network(void *pvParameters) {
                 WiFi.begin(wifi_ssid, wifi_pass);
                 wifi_retries++;
                 if (wifi_retries >= MAX_WIFI_RETRIES) {
-                    Serial.println("Switching to Offline AP Mode...");
+                    Serial.println("Max retries reached. Switching to Offline Mode.");
                     currentSystemMode = MODE_OFFLINE;
-                    WiFi.disconnect();
-                    WiFi.softAP("SmartFarm_Config", "12345678");
-                    dnsServer.start(53, "*", WiFi.softAPIP());
                 }
                 vTaskDelay(pdMS_TO_TICKS(5000));
             }
         } else {
-            // AP Mode / Captive Portal Logic
+            // Requirement 1: Fix Network Crash & AP Mode Init
+            if (!ap_started) {
+                WiFi.mode(WIFI_AP);
+                if (WiFi.softAP(ap_ssid, ap_pass)) {
+                    dnsServer.start(53, "*", WiFi.softAPIP());
+                    ap_started = true;
+                    Serial.println("Offline AP Mode Started");
+                }
+            }
             dnsServer.processNextRequest();
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -352,15 +363,15 @@ void Task_Storage(void *pvParameters) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(STORAGE_INTERVAL));
         
-        // 1. SD Card Batch Logging
-        if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        // Requirement 2 & 5: SD Batch Logging with safety check
+        if (sd_ready && xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             File file = SD.open("/data.csv", FILE_APPEND);
             if (file) {
                 DateTime now = rtc.now();
                 file.printf("%d/%d/%d %d:%d:%d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
                 
-                // Log all 9 sensors sequentially
-                for (int i = 0; i < S_NONE; i++) {
+                // Log all sensors in latestSensors array
+                for (int i = 0; i < MAX_SENSORS; i++) {
                     if (latestSensors[i].is_valid) {
                         file.printf(",%.2f", latestSensors[i].value);
                     } else {
@@ -369,19 +380,15 @@ void Task_Storage(void *pvParameters) {
                 }
                 file.println();
                 file.close();
-                Serial.println("SD: All sensors logged successfully");
-            } else {
-                Serial.println("SD: Failed to open data.csv");
             }
             xSemaphoreGive(bufferMutex);
         }
 
-        // 2. Cloud Sync (MQTT)
         if (mqttClient.connected()) {
             JsonDocument doc;
             doc["device_id"] = WiFi.macAddress();
             JsonObject readings = doc["readings"].to<JsonObject>();
-            for (int i = 0; i < S_NONE; i++) {
+            for (int i = 0; i < MAX_SENSORS; i++) {
                 if (latestSensors[i].is_valid) {
                     readings[String(i)] = serialized(String(latestSensors[i].value, 2));
                 }
@@ -389,7 +396,6 @@ void Task_Storage(void *pvParameters) {
             String payload;
             serializeJson(doc, payload);
             mqttClient.publish(logTopic.c_str(), payload.c_str());
-            Serial.println("Cloud: Batch logs published");
         }
     }
 }
