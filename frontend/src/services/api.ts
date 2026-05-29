@@ -48,6 +48,27 @@ export const apiService = {
     }
   },
 
+  // Supabase Realtime Subscriptions
+  subscribeToSensors(callback: (readings: any) => void) {
+    if (IS_OFFLINE) return null;
+    return supabase
+      .channel('sensor-logs-channel')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_logs' }, (payload) => {
+        callback(payload.new.payload);
+      })
+      .subscribe();
+  },
+
+  subscribeToRelays(callback: (relay: any) => void) {
+    if (IS_OFFLINE) return null;
+    return supabase
+      .channel('relay-configs-channel')
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'relay_configs' }, (payload) => {
+        callback(payload.new);
+      })
+      .subscribe();
+  },
+
   async updateRelay(channel: number, payload: any) {
     if (IS_OFFLINE) {
       return axios.post(`/api/relay/${channel}`, payload);
@@ -60,9 +81,7 @@ export const apiService = {
     if (IS_OFFLINE) {
       return axios.post('/api/calibrate', payload);
     } else {
-      // In cloud mode, you might update a 'devices' or 'calibrations' table
       return supabase.from('sensor_configs').update({
-        // Simplified: storage of slope/intercept in JSON field
         display_color_logic: payload 
       }).eq('sensor_type', 'pH');
     }

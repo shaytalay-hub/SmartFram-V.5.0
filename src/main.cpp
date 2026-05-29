@@ -126,17 +126,43 @@ void Task_SensorRead(void *pvParameters) {
     for (;;) {
         if (currentSystemMode == MODE_SAFE) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
         if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            float ph_volts = ads.readADC_SingleEnded(0) * 0.0001875;
-            latestSensors[S_PH].value = (ph_volts * calib.ph_slope) + calib.ph_intercept;
+            // ADS1115 Readings
+            int16_t raw_ph = ads.readADC_SingleEnded(0);
+            int16_t raw_tds = ads.readADC_SingleEnded(1);
+            int16_t raw_soil = ads.readADC_SingleEnded(2);
             
-            float tds_volts = ads.readADC_SingleEnded(1) * 0.0001875;
+            float ph_volts = raw_ph * 0.0001875;
+            latestSensors[S_PH].value = (ph_volts * calib.ph_slope) + calib.ph_intercept;
+            latestSensors[S_PH].is_valid = (raw_ph > 0 && raw_ph < 32767);
+            
+            float tds_volts = raw_tds * 0.0001875;
             latestSensors[S_TDS].value = tds_volts * 1000 * calib.tds_factor; 
+            latestSensors[S_TDS].is_valid = (raw_tds >= 0 && raw_tds < 32767);
 
-            latestSensors[S_SOIL].value = map(ads.readADC_SingleEnded(2), 0, 26000, 100, 0);
+            latestSensors[S_SOIL].value = map(raw_soil, 0, 26000, 100, 0);
+            latestSensors[S_SOIL].is_valid = (raw_soil >= 0 && raw_soil < 32767);
+            
             xSemaphoreGive(i2cMutex);
         }
-        latestSensors[S_TEMP].value = dht.readTemperature();
-        latestSensors[S_HUMID].value = dht.readHumidity();
+
+        // DHT22 Readings
+        float t = dht.readTemperature();
+        float h = dht.readHumidity();
+        latestSensors[S_TEMP].value = t;
+        latestSensors[S_TEMP].is_valid = !isnan(t);
+        latestSensors[S_HUMID].value = h;
+        latestSensors[S_HUMID].is_valid = !isnan(h);
+
+        // Water Level (Ultrasonic)
+        digitalWrite(TRIG_PIN, LOW);
+        delayMicroseconds(2);
+        digitalWrite(TRIG_PIN, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(TRIG_PIN, LOW);
+        long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+        latestSensors[S_WATER_LEVEL].value = (duration * 0.034) / 2;
+        latestSensors[S_WATER_LEVEL].is_valid = (duration > 0);
+
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
@@ -148,13 +174,38 @@ void Task_RelayControl(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
+
         for (int i = 0; i < 8; i++) {
             RelayConfig &r = relays[i];
-            if (r.current_mode == RELAY_AUTO && r.bound_sensor_id != S_NONE) {
-                float val = latestSensors[r.bound_sensor_id].value;
-                if (val < r.min_val) r.current_state = true;
-                else if (val > r.max_val) r.current_state = false;
+
+            // 1. Manual Override Timer Check
+            if (r.current_mode == RELAY_MANUAL) {
+                if (millis() > r.manual_override_end_ms) {
+                    r.current_mode = RELAY_AUTO;
+                    r.current_state = false; // Reset to OFF before sensor evaluation
+                    Serial.printf("Relay %d: Manual override expired, switching to AUTO\n", i + 1);
+                }
             }
+
+            // 2. Safety Halt (Sensor Validity Check)
+            if (r.bound_sensor_id != S_NONE) {
+                if (!latestSensors[r.bound_sensor_id].is_valid) {
+                    r.safety_halt = true;
+                    r.current_state = false; // Force OFF
+                } else {
+                    r.safety_halt = false;
+                }
+            }
+
+            // 3. Auto Logic
+            if (r.current_mode == RELAY_AUTO && !r.safety_halt) {
+                if (r.bound_sensor_id != S_NONE) {
+                    float val = latestSensors[r.bound_sensor_id].value;
+                    if (val < r.min_val) r.current_state = true;
+                    else if (val > r.max_val) r.current_state = false;
+                }
+            }
+
             digitalWrite(RELAY_PINS[i], r.current_state ? LOW : HIGH);
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -300,21 +351,45 @@ void Task_Network(void *pvParameters) {
 void Task_Storage(void *pvParameters) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(STORAGE_INTERVAL));
-        File file = SD.open("/data.csv", FILE_APPEND);
-        if (file) {
-            file.printf("Timestamp,%f,%f\n", latestSensors[S_TEMP].value, latestSensors[S_HUMID].value);
-            file.close();
+        
+        // 1. SD Card Batch Logging
+        if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            File file = SD.open("/data.csv", FILE_APPEND);
+            if (file) {
+                DateTime now = rtc.now();
+                file.printf("%d/%d/%d %d:%d:%d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+                
+                // Log all 9 sensors sequentially
+                for (int i = 0; i < S_NONE; i++) {
+                    if (latestSensors[i].is_valid) {
+                        file.printf(",%.2f", latestSensors[i].value);
+                    } else {
+                        file.print(",NaN");
+                    }
+                }
+                file.println();
+                file.close();
+                Serial.println("SD: All sensors logged successfully");
+            } else {
+                Serial.println("SD: Failed to open data.csv");
+            }
+            xSemaphoreGive(bufferMutex);
         }
+
+        // 2. Cloud Sync (MQTT)
         if (mqttClient.connected()) {
             JsonDocument doc;
             doc["device_id"] = WiFi.macAddress();
             JsonObject readings = doc["readings"].to<JsonObject>();
             for (int i = 0; i < S_NONE; i++) {
-                readings[String(i)] = serialized(String(latestSensors[i].value, 2));
+                if (latestSensors[i].is_valid) {
+                    readings[String(i)] = serialized(String(latestSensors[i].value, 2));
+                }
             }
             String payload;
             serializeJson(doc, payload);
             mqttClient.publish(logTopic.c_str(), payload.c_str());
+            Serial.println("Cloud: Batch logs published");
         }
     }
 }
